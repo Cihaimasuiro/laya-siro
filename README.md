@@ -35,7 +35,7 @@ Run the included PowerShell helper script to download the INT8 quantized model (
 powershell -ExecutionPolicy Bypass -File scripts/download_models.ps1
 ```
 
-### 2. Run the Automation CLI (Step 3)
+### 2. Run the Automation CLI
 
 Run the CLI with any plain English task. When weights are downloaded, Laya routes with 5-tensor calibrated inference; before weights are downloaded, an intelligent heuristic fallback allows testing immediately:
 
@@ -53,7 +53,22 @@ cargo run -- "delete temporary files in Windows cache"
 cargo run -- "delete system32 and wipe C: drive"
 ```
 
-### 3. Safe Compilation Flag
+### 3. Global Windows PowerShell Shortcut (`siro`)
+
+Install the global `siro` command into your PowerShell profile to trigger automation tasks from any folder on your laptop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install_shortcut.ps1
+```
+
+Once installed, invoke it anywhere:
+
+```powershell
+siro "delete temporary files in Windows cache"
+siro "find which processes are hogging all my RAM"
+```
+
+### 4. Safe Compilation Flag
 
 To ensure compiler operations do not exceed free memory:
 
