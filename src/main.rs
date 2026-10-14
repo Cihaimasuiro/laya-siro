@@ -336,21 +336,40 @@ fn main() -> Result<()> {
             println!("[FALLBACK] Running rule-based dry-run dispatch test...");
         }
         let (action, conf) = fallback_heuristic_routing(&input_prompt);
+        let mutating = is_action_mutating(action);
+
+        log_automation_event(
+            &models_dir,
+            &input_prompt,
+            action,
+            conf,
+            "HEURISTIC_FALLBACK",
+            if mutating { "DRY_RUN" } else { "READ_ONLY" },
+            if mutating { "FALLBACK_PREVIEW_ONLY" } else { "SUCCESS" },
+        );
+
         if json_mode {
             emit_json_and_exit(
                 action,
                 conf,
                 false,
-                is_action_mutating(action),
+                mutating,
                 0.0,
                 "HEURISTIC_FALLBACK",
-                "SUCCESS",
-                None,
+                if mutating { "PREVIEW_ONLY" } else { "SUCCESS" },
+                if mutating {
+                    Some("Fallback mode prohibits mutating execution. Dry-run preview only.".to_string())
+                } else {
+                    None
+                },
             );
         } else {
             println!("Predicted Action : {}", action);
             println!("Confidence Score : {:.2}%\n", conf * 100.0);
-            execute_windows_action(action, &input_prompt, execute_mode)?;
+            if mutating {
+                println!("[SAFEGUARD] Fallback mode is strictly read-only. Mutating action '{}' locked to preview.", action);
+            }
+            execute_windows_action(action, &input_prompt, false)?;
         }
         return Ok(());
     }
@@ -442,6 +461,30 @@ fn main() -> Result<()> {
     // 5. Guardrail Gate 4: Mutating Action Execution & Confirmation
     let mutating = is_action_mutating(result.action);
 
+    if json_mode {
+        log_automation_event(
+            &models_dir,
+            &input_prompt,
+            result.action,
+            result.confidence,
+            "NEURAL_MODEL",
+            if execute_mode { "EXECUTE" } else { "DRY_RUN" },
+            if mutating && !execute_mode { "PREVIEW_ONLY" } else { "SUCCESS" },
+        );
+
+        emit_json_and_exit(
+            result.action,
+            result.confidence,
+            result.should_escalate,
+            mutating,
+            result.latency_ms,
+            "NEURAL_MODEL",
+            if mutating && !execute_mode { "PREVIEW_ONLY" } else { "SUCCESS" },
+            None,
+        );
+        return Ok(());
+    }
+
     if mutating {
         if !execute_mode {
             log_automation_event(
@@ -454,22 +497,9 @@ fn main() -> Result<()> {
                 "PREVIEW_COMPLETED",
             );
 
-            if json_mode {
-                emit_json_and_exit(
-                    result.action,
-                    result.confidence,
-                    result.should_escalate,
-                    true,
-                    result.latency_ms,
-                    "NEURAL_MODEL",
-                    "PREVIEW_ONLY",
-                    None,
-                );
-            } else {
-                println!("[DRY-RUN DEFAULT] Action '{}' is mutating. Running in preview mode.", result.action);
-                execute_windows_action(result.action, &input_prompt, false)?;
-                println!("\n[HINT] To apply actual changes, re-run with '--execute' and confirm the prompt [y/N].");
-            }
+            println!("[DRY-RUN DEFAULT] Action '{}' is mutating. Running in preview mode.", result.action);
+            execute_windows_action(result.action, &input_prompt, false)?;
+            println!("\n[HINT] To apply actual changes, re-run with '--execute' and confirm the prompt [y/N].");
             return Ok(());
         }
 
@@ -485,20 +515,7 @@ fn main() -> Result<()> {
                 "USER_CANCELLED",
             );
 
-            if json_mode {
-                emit_json_and_exit(
-                    result.action,
-                    result.confidence,
-                    result.should_escalate,
-                    true,
-                    result.latency_ms,
-                    "NEURAL_MODEL",
-                    "USER_CANCELLED",
-                    Some("Operation was cancelled by the user at confirmation prompt".to_string()),
-                );
-            } else {
-                println!("\n[ABORTED] Action cancelled by user. No system changes were made.");
-            }
+            println!("\n[ABORTED] Action cancelled by user. No system changes were made.");
             return Ok(());
         }
     }
@@ -514,20 +531,7 @@ fn main() -> Result<()> {
         "SUCCESS",
     );
 
-    if json_mode {
-        emit_json_and_exit(
-            result.action,
-            result.confidence,
-            result.should_escalate,
-            mutating,
-            result.latency_ms,
-            "NEURAL_MODEL",
-            "SUCCESS",
-            None,
-        );
-    } else {
-        execute_windows_action(result.action, &input_prompt, execute_mode)?;
-    }
+    execute_windows_action(result.action, &input_prompt, execute_mode)?;
 
     Ok(())
 }

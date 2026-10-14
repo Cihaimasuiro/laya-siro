@@ -39,8 +39,8 @@ if (Test-Path "$env:TEMP\siro_out.json") {
 
     try {
         $Obj = $RawJson | ConvertFrom-Json
-        # Add safety flag for AI agents
-        $ShouldAsk = ($Obj.confidence -lt 0.75) -or ($Obj.escalate -eq $true) -or ($Obj.mutating -eq $true -and -not $Execute)
+        # Add safety flag for AI agents: always require user confirmation for mutating actions
+        $ShouldAsk = ($Obj.confidence -lt 0.75) -or ($Obj.escalate -eq $true) -or ($Obj.mutating -eq $true)
         $Obj | Add-Member -NotePropertyName "should_ask_user" -NotePropertyValue $ShouldAsk -Force
         return ($Obj | ConvertTo-Json -Depth 5)
     } catch {
