@@ -75,17 +75,27 @@ const ROUTER_QUESTION: &str = "Which Windows automation action should be execute
 
 /// Strict hard-coded forbidden command patterns (always blocked regardless of model confidence)
 const HARD_BLOCKED_PATTERNS: &[&str] = &[
-    "migrate:fresh",
-    "migrate:rollback",
+    // Data, migrations, and database state protection (strictly prohibited for absensi-cam)
+    "migrate",
+    "db:seed",
+    "db:wipe",
+    "key:generate",
+    "app:prune",
+    "app:tombstone",
+    "app:push-model-update",
+    "sync_to_server",
+    "deploy",
+    "drop database",
+    // Git destructive operations
     "git push --force",
     "git push -f",
     "git reset --hard",
+    // System wipe & destructive filesystem commands
     "system32",
     "format c:",
     "wipe c:",
     "rmdir /s",
     "del /f /s",
-    "drop database",
 ];
 
 /// Minimum confidence floor required to execute any predicted action
@@ -101,15 +111,40 @@ fn check_hard_blocked(prompt: &str) -> Option<&'static str> {
     None
 }
 
-/// Identifies read-only Git operations before delegating to neural routing
-fn check_git_intent(prompt: &str) -> Option<(&'static str, &'static str)> {
+/// Deterministic fast-path allowlist for safe developer commands and strictly gated operations
+fn check_allowlisted_fast_path(prompt: &str) -> Option<(&'static str, &'static str, bool)> {
     let lower = prompt.to_lowercase();
-    if lower.contains("git status") || lower == "status" || lower.contains("repo status") || lower.contains("uncommitted") {
-        Some(("git_status", "Query Git Working Tree Status"))
-    } else if lower.contains("git log") || lower.contains("commit history") || lower.contains("recent commits") || lower.contains("git history") {
-        Some(("git_log", "Query Recent Git Commit Log (last 5)"))
-    } else if lower.contains("git stash") || lower.contains("stash list") || lower.contains("stashed changes") {
-        Some(("git_stash_list", "Query Stashed Git Changes"))
+    let trimmed = lower.trim();
+
+    // Tier 1: Laravel Read-Only Checks
+    if trimmed.contains("artisan test") || trimmed == "test" || trimmed.contains("run tests") || trimmed.contains("backend tests") {
+        Some(("laravel_test", "Run Laravel Backend Test Suite (php artisan test)", false))
+    } else if trimmed.contains("route:list") || trimmed.contains("list routes") || trimmed.contains("show routes") {
+        Some(("laravel_route_list", "Inspect Laravel Registered Routes (php artisan route:list)", false))
+
+    // Tier 2: Edge Engine & Protocol Checks (Read-Only)
+    } else if trimmed.contains("edge-engine") || trimmed.contains("check edge") || trimmed.contains("edge check") {
+        Some(("edge_engine_check", "Verify Edge Engine Compilation (cargo check -j 2)", false))
+    } else if trimmed.contains("protocol test") || trimmed.contains("test protocol") || trimmed.contains("packages/protocol") {
+        Some(("protocol_test", "Test Terminal Protocol (cargo test in packages/protocol)", false))
+
+    // Tier 3: Git Read-Only Checks
+    } else if trimmed.contains("git diff") || trimmed.contains("diff stat") || trimmed == "diff" {
+        Some(("git_diff", "Query Git Working Tree Diff Summary (git diff --stat)", false))
+    } else if trimmed.contains("git status") || trimmed == "status" || trimmed.contains("repo status") || trimmed.contains("uncommitted") {
+        Some(("git_status", "Query Git Working Tree Status (git status --short)", false))
+    } else if trimmed.contains("git log") || trimmed.contains("commit history") || trimmed.contains("recent commits") || trimmed.contains("git history") {
+        Some(("git_log", "Query Recent Git Commit Log (git log -n 5 --oneline)", false))
+    } else if trimmed.contains("git stash") || trimmed.contains("stash list") || trimmed.contains("stashed changes") {
+        Some(("git_stash_list", "Query Stashed Git Changes (git stash list)", false))
+
+    // Tier 4: Mutating Actions (Strictly Gated with Dry-Run Default and [y/N] Confirmation)
+    } else if trimmed.contains("git pull") || trimmed.contains("pull changes") || trimmed == "pull" {
+        Some(("git_pull_ff_only", "Fast-Forward Git Pull (git pull --ff-only, dirty-tree protected)", true))
+    } else if trimmed.contains("npm run build") || trimmed.contains("build assets") || trimmed.contains("build frontend") {
+        Some(("npm_build", "Compile Frontend Assets (npm run build)", true))
+    } else if trimmed.contains("optimize:clear") || trimmed.contains("clear cache") || trimmed.contains("artisan cache:clear") {
+        Some(("laravel_clear_cache", "Clear Laravel Caches (php artisan optimize:clear)", true))
     } else {
         None
     }
@@ -117,8 +152,13 @@ fn check_git_intent(prompt: &str) -> Option<(&'static str, &'static str)> {
 
 fn is_action_mutating(action: &str) -> bool {
     match action {
-        "system_triage" | "git_status" | "git_log" | "git_stash_list" | "block_unsafe" => false,
-        "clean_temp" | "organize_downloads" => true,
+        "system_triage" | "git_status" | "git_log" | "git_stash_list" | "git_diff"
+        | "laravel_test" | "laravel_route_list" | "edge_engine_check" | "protocol_test"
+        | "block_unsafe" => false,
+
+        "clean_temp" | "organize_downloads" | "git_pull_ff_only" | "npm_build"
+        | "laravel_clear_cache" => true,
+
         _ => true,
     }
 }
@@ -281,36 +321,65 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 2. Guardrail Gate 2: Read-Only Git Intent Fast Path
-    if let Some((git_action, git_desc)) = check_git_intent(&input_prompt) {
+    // 2. Guardrail Gate 2: Deterministic Fast-Path Allowlist
+    if let Some((action, desc, mutating)) = check_allowlisted_fast_path(&input_prompt) {
         log_automation_event(
             &models_dir,
             &input_prompt,
-            git_action,
+            action,
             1.0,
             "DETERMINISTIC_FAST_PATH",
-            "READ_ONLY",
+            if mutating {
+                if execute_mode { "EXECUTE" } else { "DRY_RUN" }
+            } else {
+                "READ_ONLY"
+            },
             "SUCCESS",
         );
 
         if json_mode {
             emit_json_and_exit(
-                git_action,
+                action,
                 1.0,
                 false,
-                false,
+                mutating,
                 0.0,
                 "DETERMINISTIC_FAST_PATH",
-                "SUCCESS",
+                if mutating && !execute_mode { "PREVIEW_ONLY" } else { "SUCCESS" },
                 None,
             );
-        } else {
-            println!(">>> Detected Read-Only Git Intent: {} <<<", git_desc);
-            println!("Action     : {}", git_action);
-            println!("Confidence : 100.00% (Deterministic Read-Only)");
-            println!("Safety     : Passed (Non-mutating)\n");
-            execute_windows_action(git_action, &input_prompt, false)?;
+            return Ok(());
         }
+
+        println!(">>> Detected Allowlisted Intent: {} <<<", desc);
+        println!("Action     : {}", action);
+        println!("Confidence : 100.00% (Deterministic Allowlist)");
+        println!("Safety     : {}\n", if mutating { "Mutating (Requires --execute and [y/N] confirmation)" } else { "Passed (Read-Only)" });
+
+        if mutating {
+            if !execute_mode {
+                println!("[DRY-RUN DEFAULT] Action '{}' is mutating. Running in preview mode.", action);
+                execute_windows_action(action, &input_prompt, false)?;
+                println!("\n[HINT] To apply actual changes, re-run with '--execute' and confirm the prompt [y/N].");
+                return Ok(());
+            }
+
+            if !confirm_action(action, desc) {
+                log_automation_event(
+                    &models_dir,
+                    &input_prompt,
+                    action,
+                    1.0,
+                    "DETERMINISTIC_FAST_PATH",
+                    "EXECUTE",
+                    "USER_CANCELLED",
+                );
+                println!("\n[ABORTED] Action cancelled by user. No system changes were made.");
+                return Ok(());
+            }
+        }
+
+        execute_windows_action(action, &input_prompt, execute_mode)?;
         return Ok(());
     }
 
@@ -954,6 +1023,231 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
                 Err(e) => {
                     println!("[ERROR] Failed to execute git: {}", e);
                 }
+            }
+        }
+
+        "git_diff" => {
+            println!("\n>>> Running Read-Only Git Diff (git diff --stat)...");
+            let output = Command::new("git")
+                .arg("diff")
+                .arg("--stat")
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if text.trim().is_empty() {
+                        println!("No changes in working tree against index.");
+                    } else {
+                        println!("{}", text);
+                    }
+                    println!("[DONE] Read-only Git diff completed.");
+                }
+                Ok(out) => {
+                    println!("[WARN] Git diff returned error:");
+                    println!("{}", String::from_utf8_lossy(&out.stderr));
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute git: {}", e);
+                }
+            }
+        }
+
+        "git_pull_ff_only" => {
+            println!("\n>>> Inspecting Git Working Tree Before Pull...");
+            let status_out = Command::new("git")
+                .arg("status")
+                .arg("--short")
+                .output();
+
+            if let Ok(out) = status_out {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if !text.trim().is_empty() {
+                    println!("\n[BLOCKED] Working tree is dirty with uncommitted changes:\n{}", text);
+                    println!("Refusing to pull changes while working tree has modifications.");
+                    return Ok(());
+                }
+            }
+
+            if execute_mode {
+                println!("\n>>> Running Fast-Forward Git Pull (git pull --ff-only)...");
+                let output = Command::new("git")
+                    .arg("pull")
+                    .arg("--ff-only")
+                    .output();
+
+                match output {
+                    Ok(out) => {
+                        println!("{}", String::from_utf8_lossy(&out.stdout));
+                        if !out.status.success() {
+                            println!("[WARN] Git pull error: {}", String::from_utf8_lossy(&out.stderr));
+                        } else {
+                            println!("[EXECUTED] Fast-forward git pull completed successfully.");
+                        }
+                    }
+                    Err(e) => {
+                        println!("[ERROR] Failed to execute git: {}", e);
+                    }
+                }
+            } else {
+                println!("[DRY-RUN DEFAULT] Working tree is clean. Pass '--execute' to perform 'git pull --ff-only'.");
+            }
+        }
+
+        "laravel_test" => {
+            println!("\n>>> Running Laravel Backend Tests (php artisan test)...");
+            let output = Command::new("php")
+                .arg("artisan")
+                .arg("test")
+                .output();
+
+            match output {
+                Ok(out) => {
+                    println!("{}", String::from_utf8_lossy(&out.stdout));
+                    if !out.status.success() {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        if !err.trim().is_empty() {
+                            println!("[WARN] Test runner stderr: {}", err);
+                        }
+                    }
+                    println!("[DONE] Laravel test suite execution finished.");
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute 'php artisan test': {}", e);
+                    println!("Ensure PHP is installed and available in PATH, or run from Laravel project root.");
+                }
+            }
+        }
+
+        "laravel_route_list" => {
+            println!("\n>>> Inspecting Laravel Routes (php artisan route:list)...");
+            let output = Command::new("php")
+                .arg("artisan")
+                .arg("route:list")
+                .output();
+
+            match output {
+                Ok(out) => {
+                    println!("{}", String::from_utf8_lossy(&out.stdout));
+                    if !out.status.success() {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        if !err.trim().is_empty() {
+                            println!("[WARN] Route list stderr: {}", err);
+                        }
+                    }
+                    println!("[DONE] Route inspection finished.");
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute 'php artisan route:list': {}", e);
+                    println!("Ensure PHP is installed and available in PATH, or run from Laravel project root.");
+                }
+            }
+        }
+
+        "edge_engine_check" => {
+            println!("\n>>> Compile-Checking Edge Engine (cargo check -j 2)...");
+            let edge_dir = Path::new("clients/edge-engine-rs");
+            let mut cmd = Command::new("cargo");
+            cmd.arg("check").arg("-j").arg("2");
+            if edge_dir.exists() {
+                cmd.current_dir(edge_dir);
+                println!("Working directory: {:?}", edge_dir);
+            } else {
+                println!("[INFO] 'clients/edge-engine-rs' not in current directory. Checking current workspace...");
+            }
+
+            match cmd.output() {
+                Ok(out) => {
+                    println!("{}", String::from_utf8_lossy(&out.stderr));
+                    if out.status.success() {
+                        println!("[DONE] Edge engine compilation check passed.");
+                    } else {
+                        println!("[WARN] Edge engine compilation returned errors.");
+                    }
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute cargo: {}", e);
+                }
+            }
+        }
+
+        "protocol_test" => {
+            println!("\n>>> Testing Terminal Protocol (cargo test)...");
+            let proto_dir = Path::new("packages/protocol");
+            let mut cmd = Command::new("cargo");
+            cmd.arg("test");
+            if proto_dir.exists() {
+                cmd.current_dir(proto_dir);
+                println!("Working directory: {:?}", proto_dir);
+            } else {
+                println!("[INFO] 'packages/protocol' not in current directory. Running cargo test locally...");
+            }
+
+            match cmd.output() {
+                Ok(out) => {
+                    println!("{}", String::from_utf8_lossy(&out.stdout));
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    if !err.trim().is_empty() {
+                        println!("{}", err);
+                    }
+                    println!("[DONE] Protocol tests finished.");
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute cargo test: {}", e);
+                }
+            }
+        }
+
+        "npm_build" => {
+            if execute_mode {
+                println!("\n>>> Building Frontend Assets (npm run build)...");
+                let npm_bin = if cfg!(windows) { "npm.cmd" } else { "npm" };
+                let output = Command::new(npm_bin)
+                    .arg("run")
+                    .arg("build")
+                    .output();
+
+                match output {
+                    Ok(out) => {
+                        println!("{}", String::from_utf8_lossy(&out.stdout));
+                        if !out.status.success() {
+                            println!("[WARN] Frontend build error: {}", String::from_utf8_lossy(&out.stderr));
+                        } else {
+                            println!("[EXECUTED] Frontend assets built successfully.");
+                        }
+                    }
+                    Err(e) => {
+                        println!("[ERROR] Failed to execute npm: {}", e);
+                    }
+                }
+            } else {
+                println!("\n[DRY-RUN DEFAULT] Target command: 'npm run build'. Pass '--execute' and confirm [y/N] to compile assets.");
+            }
+        }
+
+        "laravel_clear_cache" => {
+            if execute_mode {
+                println!("\n>>> Clearing Laravel Caches (php artisan optimize:clear)...");
+                let output = Command::new("php")
+                    .arg("artisan")
+                    .arg("optimize:clear")
+                    .output();
+
+                match output {
+                    Ok(out) => {
+                        println!("{}", String::from_utf8_lossy(&out.stdout));
+                        if !out.status.success() {
+                            println!("[WARN] Optimize clear error: {}", String::from_utf8_lossy(&out.stderr));
+                        } else {
+                            println!("[EXECUTED] Laravel application caches cleared.");
+                        }
+                    }
+                    Err(e) => {
+                        println!("[ERROR] Failed to execute 'php artisan optimize:clear': {}", e);
+                    }
+                }
+            } else {
+                println!("\n[DRY-RUN DEFAULT] Target command: 'php artisan optimize:clear'. Pass '--execute' and confirm [y/N] to clear caches.");
             }
         }
 

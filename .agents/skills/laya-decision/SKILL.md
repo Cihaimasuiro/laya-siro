@@ -16,12 +16,20 @@ Use `laya-decision` to classify user automation requests into bounded, allowlist
 | Action Label | Type | Description | Guardrail Policy |
 | :--- | :--- | :--- | :--- |
 | `system_triage` | Read-only | Top RAM WorkingSet process query | Executes directly without confirmation |
+| `laravel_test` | Read-only | `php artisan test` backend suite | Executes directly without confirmation |
+| `laravel_route_list` | Read-only | `php artisan route:list` inspection | Executes directly without confirmation |
+| `edge_engine_check` | Read-only | `cargo check -j 2` in `clients/edge-engine-rs` | Executes directly without confirmation |
+| `protocol_test` | Read-only | `cargo test` in `packages/protocol` | Executes directly without confirmation |
+| `git_diff` | Read-only | `git diff --stat` working tree summary | Executes directly without confirmation |
 | `git_status` | Read-only | `git status --short` in current workspace | Executes directly without confirmation |
 | `git_log` | Read-only | `git log -n 5 --oneline` commit history | Executes directly without confirmation |
 | `git_stash_list` | Read-only | `git stash list` stashed changes query | Executes directly without confirmation |
+| `git_pull_ff_only` | Mutating | `git pull --ff-only` | Refuses dirty tree; dry-run preview default; requires `--execute` + `[y/N]` |
+| `npm_build` | Mutating | `npm run build` frontend asset compilation | Dry-run preview default; requires `--execute` + `[y/N]` |
+| `laravel_clear_cache` | Mutating | `php artisan optimize:clear` | Dry-run preview default; requires `--execute` + `[y/N]` |
 | `clean_temp` | Mutating | Inspects or clears `AppData\Local\Temp` | Dry-run preview default; requires `--execute` + `[y/N]` |
-| `organize_downloads` | Mutating | Categorizes files in `Downloads/` | Dry-run preview default; requires `--execute` + `[y/N]` |
-| `block_unsafe` / `hard_blocked` | Safety | Flags destructive / prohibited commands | Permanently blocked; zero execution |
+| `organize_downloads` | Mutating | Categorizes files in `Downloads/` | Safeguard locked to preview |
+| `block_unsafe` / `hard_blocked` | Safety | Flags destructive / prohibited commands (`migrate`, `db:seed`, `db:wipe`, `key:generate`, `app:prune`, `sync_to_server`) | Permanently blocked; zero execution |
 
 ---
 

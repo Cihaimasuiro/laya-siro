@@ -30,11 +30,15 @@
 4. **Minimum Confidence Floor (>= 75.0%):**
    * Model decisions with confidence `< 0.75` or where the act gate triggers abstain/escalate must be aborted automatically.
 
-5. **Security Hard-Block Policy:**
-   * Destructive commands (`migrate:fresh`, `git push --force`, `system32`, `format`, `wipe`, `rmdir /s`, `del /f /s`) are permanently prohibited in code.
-   * Hard-blocked requests must terminate immediately without shell invocation.
+5. **Security Hard-Block Policy (Absensi-Cam Data & Secret Protection):**
+   * Database mutations, migrations, seeders, keys, pruning, and server syncs (`migrate`, `db:seed`, `db:wipe`, `key:generate`, `app:prune`, `app:tombstone`, `sync_to_server`, `deploy`) are permanently prohibited in code.
+   * Destructive system commands (`git push --force`, `system32`, `format`, `wipe`, `rmdir /s`, `del /f /s`) are permanently prohibited.
+   * Hard-blocked requests terminate immediately (0 ms) without shell invocation.
 
-6. **Audit Trail:**
+6. **Dirty-Tree Git Pull Protection:**
+   * `git pull --ff-only` must check `git status --short` first and refuse execution if any modified or untracked files exist, safeguarding uncommitted face template or attendance code.
+
+7. **Audit Trail:**
    * Every routing attempt, confidence score, routing source, mode, and execution outcome must be logged to `logs/automation.log`.
    * `logs/` must remain local and ignored in `.gitignore`.
 
