@@ -1096,6 +1096,12 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
 
         "laravel_test" => {
             println!("\n>>> Running Laravel Backend Tests (php artisan test)...");
+            if !Path::new("artisan").exists() {
+                println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
+                println!("Please run this command from the root of your Laravel project (absensi-cam).");
+                return Ok(());
+            }
+
             let output = Command::new("php")
                 .arg("artisan")
                 .arg("test")
@@ -1121,6 +1127,12 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
 
         "laravel_route_list" => {
             println!("\n>>> Inspecting Laravel Routes (php artisan route:list)...");
+            if !Path::new("artisan").exists() {
+                println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
+                println!("Please run this command from the root of your Laravel project (absensi-cam).");
+                return Ok(());
+            }
+
             let output = Command::new("php")
                 .arg("artisan")
                 .arg("route:list")
@@ -1201,6 +1213,12 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
         "npm_build" => {
             if execute_mode {
                 println!("\n>>> Building Frontend Assets (npm run build)...");
+                if !Path::new("package.json").exists() {
+                    println!("[INFO] 'package.json' not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
+                    println!("Please run this command from the directory containing package.json.");
+                    return Ok(());
+                }
+
                 let npm_bin = if cfg!(windows) { "npm.cmd" } else { "npm" };
                 let output = Command::new(npm_bin)
                     .arg("run")
@@ -1228,6 +1246,12 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
         "laravel_clear_cache" => {
             if execute_mode {
                 println!("\n>>> Clearing Laravel Caches (php artisan optimize:clear)...");
+                if !Path::new("artisan").exists() {
+                    println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
+                    println!("Please run this command from the root of your Laravel project (absensi-cam).");
+                    return Ok(());
+                }
+
                 let output = Command::new("php")
                     .arg("artisan")
                     .arg("optimize:clear")
