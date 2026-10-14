@@ -46,19 +46,20 @@ fn main() -> Result<()> {
     println!("==================================================");
     println!("Prompt: \"{}\"\n", input_prompt);
 
-    let fast_model = PathBuf::from("models/model_fast.onnx");
-    let base_model = PathBuf::from("models/model.onnx");
+    let models_dir = resolve_models_dir();
+    let fast_model = models_dir.join("model_fast.onnx");
+    let base_model = models_dir.join("model.onnx");
     let model_path = if fast_model.exists() {
         println!("[Fast Inference Engine] Using optimized sequence-length model: {:?}", fast_model);
         fast_model
     } else {
         base_model
     };
-    let tokenizer_path = PathBuf::from("models/tokenizer.json");
-    let config_path = PathBuf::from("models/rl_agent_config.json");
+    let tokenizer_path = models_dir.join("tokenizer.json");
+    let config_path = models_dir.join("rl_agent_config.json");
 
     if !model_path.exists() || !tokenizer_path.exists() {
-        println!("[WARN] Model weights not found in models/ directory.");
+        println!("[WARN] Model weights not found in {:?}.", models_dir);
         println!("Please download the INT8 weights first by running:");
         println!("  powershell -ExecutionPolicy Bypass -File scripts/download_models.ps1\n");
         println!("[FALLBACK] Running rule-based dry-run dispatch test...");
@@ -70,7 +71,7 @@ fn main() -> Result<()> {
     }
 
     // 1. Initialize ONNX Runtime environment
-    let dylib_path = PathBuf::from("models/onnxruntime.dll");
+    let dylib_path = models_dir.join("onnxruntime.dll");
     let env = if dylib_path.exists() {
         println!("[ORT Engine] Loaded runtime from: {:?}", dylib_path);
         ort::init_from(&dylib_path)
@@ -150,6 +151,32 @@ fn print_usage(prog_name: &str) {
     println!("  {} \"tidy up my downloads folder by sorting files\"", prog_name);
     println!("  {} \"delete temporary files in Windows cache\"", prog_name);
     println!("  {} \"delete system32 and wipe C: drive\"", prog_name);
+}
+
+fn resolve_models_dir() -> PathBuf {
+    if let Ok(dir) = env::var("LAYA_MODELS_DIR") {
+        let p = PathBuf::from(dir);
+        if p.exists() {
+            return p;
+        }
+    }
+    let cwd_models = PathBuf::from("models");
+    if cwd_models.exists() {
+        return cwd_models;
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let rel = parent.join("../../models");
+            if rel.exists() {
+                return rel;
+            }
+            let adj = parent.join("models");
+            if adj.exists() {
+                return adj;
+            }
+        }
+    }
+    PathBuf::from("models")
 }
 
 /// Builds an ORT session strictly capped for minimal memory overhead
