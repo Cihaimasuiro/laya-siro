@@ -1,7 +1,9 @@
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{stdin, stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use ndarray::{Array1, Array2};
 use ort::{
@@ -10,7 +12,7 @@ use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::TensorRef,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Deserialize)]
@@ -23,7 +25,45 @@ fn default_temperature() -> Vec<f32> {
     vec![1.05]
 }
 
-/// Available Windows automation targets
+/// Structured JSON output emitted when --json flag is passed
+#[derive(Debug, Serialize)]
+struct JsonDecisionResponse<'a> {
+    action: &'a str,
+    confidence: f32,
+    escalate: bool,
+    mutating: bool,
+    latency_ms: f64,
+    routing_source: &'static str,
+    status: &'static str,
+    error: Option<String>,
+}
+
+fn emit_json_and_exit<'a>(
+    action: &'a str,
+    confidence: f32,
+    escalate: bool,
+    mutating: bool,
+    latency_ms: f64,
+    routing_source: &'static str,
+    status: &'static str,
+    error: Option<String>,
+) {
+    let resp = JsonDecisionResponse {
+        action,
+        confidence,
+        escalate,
+        mutating,
+        latency_ms,
+        routing_source,
+        status,
+        error,
+    };
+    if let Ok(json_str) = serde_json::to_string_pretty(&resp) {
+        println!("{}", json_str);
+    }
+}
+
+/// Core neural automation options trained in Laya model
 const AUTOMATION_OPTIONS: &[&str] = &[
     "system_triage",
     "organize_downloads",
@@ -33,6 +73,146 @@ const AUTOMATION_OPTIONS: &[&str] = &[
 
 const ROUTER_QUESTION: &str = "Which Windows automation action should be executed for this request?";
 
+/// Strict hard-coded forbidden command patterns (always blocked regardless of model confidence)
+const HARD_BLOCKED_PATTERNS: &[&str] = &[
+    "migrate:fresh",
+    "migrate:rollback",
+    "git push --force",
+    "git push -f",
+    "git reset --hard",
+    "system32",
+    "format c:",
+    "wipe c:",
+    "rmdir /s",
+    "del /f /s",
+    "drop database",
+];
+
+/// Minimum confidence floor required to execute any predicted action
+const MINIMUM_CONFIDENCE_THRESHOLD: f32 = 0.75;
+
+fn check_hard_blocked(prompt: &str) -> Option<&'static str> {
+    let lower = prompt.to_lowercase();
+    for &pattern in HARD_BLOCKED_PATTERNS {
+        if lower.contains(pattern) {
+            return Some(pattern);
+        }
+    }
+    None
+}
+
+/// Identifies read-only Git operations before delegating to neural routing
+fn check_git_intent(prompt: &str) -> Option<(&'static str, &'static str)> {
+    let lower = prompt.to_lowercase();
+    if lower.contains("git status") || lower == "status" || lower.contains("repo status") || lower.contains("uncommitted") {
+        Some(("git_status", "Query Git Working Tree Status"))
+    } else if lower.contains("git log") || lower.contains("commit history") || lower.contains("recent commits") || lower.contains("git history") {
+        Some(("git_log", "Query Recent Git Commit Log (last 5)"))
+    } else if lower.contains("git stash") || lower.contains("stash list") || lower.contains("stashed changes") {
+        Some(("git_stash_list", "Query Stashed Git Changes"))
+    } else {
+        None
+    }
+}
+
+fn is_action_mutating(action: &str) -> bool {
+    match action {
+        "system_triage" | "git_status" | "git_log" | "git_stash_list" | "block_unsafe" => false,
+        "clean_temp" | "organize_downloads" => true,
+        _ => true,
+    }
+}
+
+fn confirm_action(action: &str, details: &str) -> bool {
+    print!("\n[CONFIRMATION REQUIRED] Mutating action '{}' will be executed.\nTarget: {}\nProceed? [y/N]: ", action, details);
+    let _ = stdout().flush();
+
+    let mut input = String::new();
+    if stdin().read_line(&mut input).is_ok() {
+        let trimmed = input.trim().to_lowercase();
+        trimmed == "y" || trimmed == "yes"
+    } else {
+        false
+    }
+}
+
+fn current_timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let days = now / 86400;
+    let secs_of_day = now % 86400;
+    let hours = secs_of_day / 3600;
+    let mins = (secs_of_day % 3600) / 60;
+    let secs = secs_of_day % 60;
+
+    let mut year = 1970;
+    let mut remaining_days = days;
+    loop {
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_year = if is_leap { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    let days_in_month = [
+        31, if is_leap { 29 } else { 28 }, 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31
+    ];
+    let mut month = 1;
+    for &dim in &days_in_month {
+        if remaining_days < dim {
+            break;
+        }
+        remaining_days -= dim;
+        month += 1;
+    }
+    let day = remaining_days + 1;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", year, month, day, hours, mins, secs)
+}
+
+fn log_automation_event(
+    models_dir: &Path,
+    prompt: &str,
+    action: &str,
+    confidence: f32,
+    routing_source: &str,
+    mode: &str,
+    status: &str,
+) {
+    let logs_dir = if let Some(parent) = models_dir.parent() {
+        if parent.as_os_str().is_empty() {
+            PathBuf::from("logs")
+        } else {
+            parent.join("logs")
+        }
+    } else {
+        PathBuf::from("logs")
+    };
+    let _ = fs::create_dir_all(&logs_dir);
+    let log_path = logs_dir.join("automation.log");
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let ts = current_timestamp();
+        let _ = writeln!(
+            file,
+            "[{}] PROMPT: {:?} | ACTION: {} | CONFIDENCE: {:.2}% | SOURCE: {} | MODE: {} | STATUS: {}",
+            ts,
+            prompt,
+            action,
+            confidence * 100.0,
+            routing_source,
+            mode,
+            status
+        );
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
@@ -40,17 +220,107 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let input_prompt = args[1..].join(" ");
-    println!("==================================================");
-    println!(" [Laya-Siro] Windows Low-Memory Automation Engine ");
-    println!("==================================================");
-    println!("Prompt: \"{}\"\n", input_prompt);
+    let mut execute_mode = false;
+    let mut json_mode = false;
+    let mut prompt_parts = Vec::new();
+
+    for arg in &args[1..] {
+        if arg == "--execute" || arg == "-e" {
+            execute_mode = true;
+        } else if arg == "--json" {
+            json_mode = true;
+        } else {
+            prompt_parts.push(arg.clone());
+        }
+    }
+    let input_prompt = prompt_parts.join(" ");
+
+    if input_prompt.trim().is_empty() {
+        print_usage(&args[0]);
+        return Ok(());
+    }
+
+    if !json_mode {
+        println!("==================================================");
+        println!(" [Laya-Siro] Windows Low-Memory Automation Engine ");
+        println!("==================================================");
+        println!("Prompt : \"{}\"", input_prompt);
+        println!("Mode   : {}\n", if execute_mode { "EXECUTE (--execute active)" } else { "DRY-RUN (Preview default)" });
+    }
 
     let models_dir = resolve_models_dir();
+
+    // 1. Guardrail Gate 1: Strict Hard-Block Policy Check
+    if let Some(pattern) = check_hard_blocked(&input_prompt) {
+        log_automation_event(
+            &models_dir,
+            &input_prompt,
+            "hard_blocked",
+            1.0,
+            "SECURITY_POLICY",
+            if execute_mode { "EXECUTE" } else { "DRY_RUN" },
+            "HARD_BLOCKED",
+        );
+
+        if json_mode {
+            emit_json_and_exit(
+                "hard_blocked",
+                1.0,
+                true,
+                false,
+                0.0,
+                "SECURITY_POLICY",
+                "HARD_BLOCKED",
+                Some(format!("Prohibited command pattern detected: '{}'", pattern)),
+            );
+        } else {
+            println!("\n[SECURITY HARD BLOCK] Prohibited command pattern detected: '{}'", pattern);
+            println!("Request '{}' was permanently rejected by security policy.", input_prompt);
+            println!("No changes or shell executions were performed.");
+        }
+        return Ok(());
+    }
+
+    // 2. Guardrail Gate 2: Read-Only Git Intent Fast Path
+    if let Some((git_action, git_desc)) = check_git_intent(&input_prompt) {
+        log_automation_event(
+            &models_dir,
+            &input_prompt,
+            git_action,
+            1.0,
+            "DETERMINISTIC_FAST_PATH",
+            "READ_ONLY",
+            "SUCCESS",
+        );
+
+        if json_mode {
+            emit_json_and_exit(
+                git_action,
+                1.0,
+                false,
+                false,
+                0.0,
+                "DETERMINISTIC_FAST_PATH",
+                "SUCCESS",
+                None,
+            );
+        } else {
+            println!(">>> Detected Read-Only Git Intent: {} <<<", git_desc);
+            println!("Action     : {}", git_action);
+            println!("Confidence : 100.00% (Deterministic Read-Only)");
+            println!("Safety     : Passed (Non-mutating)\n");
+            execute_windows_action(git_action, &input_prompt, false)?;
+        }
+        return Ok(());
+    }
+
+    // 3. Neural Decision Path (Laya INT8 ONNX Model)
     let fast_model = models_dir.join("model_fast.onnx");
     let base_model = models_dir.join("model.onnx");
     let model_path = if fast_model.exists() {
-        println!("[Fast Inference Engine] Using optimized sequence-length model: {:?}", fast_model);
+        if !json_mode {
+            println!("[Fast Inference Engine] Using optimized sequence-length model: {:?}", fast_model);
+        }
         fast_model
     } else {
         base_model
@@ -59,52 +329,52 @@ fn main() -> Result<()> {
     let config_path = models_dir.join("rl_agent_config.json");
 
     if !model_path.exists() || !tokenizer_path.exists() {
-        println!("[WARN] Model weights not found in {:?}.", models_dir);
-        println!("Please download the INT8 weights first by running:");
-        println!("  powershell -ExecutionPolicy Bypass -File scripts/download_models.ps1\n");
-        println!("[FALLBACK] Running rule-based dry-run dispatch test...");
+        if !json_mode {
+            println!("[WARN] Model weights not found in {:?}.", models_dir);
+            println!("Please download the INT8 weights first by running:");
+            println!("  powershell -ExecutionPolicy Bypass -File scripts/download_models.ps1\n");
+            println!("[FALLBACK] Running rule-based dry-run dispatch test...");
+        }
         let (action, conf) = fallback_heuristic_routing(&input_prompt);
-        println!("Predicted Action : {}", action);
-        println!("Confidence Score : {:.2}%\n", conf * 100.0);
-        execute_windows_action(action, &input_prompt)?;
+        if json_mode {
+            emit_json_and_exit(
+                action,
+                conf,
+                false,
+                is_action_mutating(action),
+                0.0,
+                "HEURISTIC_FALLBACK",
+                "SUCCESS",
+                None,
+            );
+        } else {
+            println!("Predicted Action : {}", action);
+            println!("Confidence Score : {:.2}%\n", conf * 100.0);
+            execute_windows_action(action, &input_prompt, execute_mode)?;
+        }
         return Ok(());
     }
 
-    // 1. Initialize ONNX Runtime environment
     let dylib_path = models_dir.join("onnxruntime.dll");
     let env = if dylib_path.exists() {
-        println!("[ORT Engine] Loaded runtime from: {:?}", dylib_path);
         ort::init_from(&dylib_path)
             .map_err(|e| anyhow!("Failed to load onnxruntime.dll: {}", e))?
             .with_name("Laya-Siro")
             .build()
             .map_err(|e| anyhow!("Failed to build ORT environment: {}", e))?
     } else {
-        println!("[ORT Engine] Initializing default system runtime...");
         ort::init()
             .with_name("Laya-Siro")
             .build()
             .map_err(|e| anyhow!("Failed to build ORT environment: {}", e))?
     };
 
-    // 2. Build low-memory session optimized for 8 GB RAM / i5-1155G7
     let mut session = build_low_memory_session(&env, &model_path)?;
 
-    println!(">>> ONNX Model Graph Inputs Inspection <<<");
-    for (i, input) in session.inputs().iter().enumerate() {
-        println!("  Input  [{}] '{}': {:?}", i, input.name(), input.dtype());
-    }
-    for (i, output) in session.outputs().iter().enumerate() {
-        println!("  Output [{}] '{}': {:?}", i, output.name(), output.dtype());
-    }
-    println!();
-
-    // 3. Load tokenizer and calibration config
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
     let temperature = load_temperature(&config_path, AUTOMATION_OPTIONS.len());
 
-    // 4. Run 5-tensor graph inference
     let result = evaluate_laya_decision(
         &mut session,
         &tokenizer,
@@ -114,42 +384,171 @@ fn main() -> Result<()> {
         temperature,
     )?;
 
-    println!("--------------------------------------------------");
-    println!(">>> Real ONNX Neural Inference Diagnostic Data <<<");
-    println!("--------------------------------------------------");
-    println!("Inference Latency: {:.2} ms", result.latency_ms);
-    println!("Model Input Contract: 5 tensors (input_ids, attention_mask, marker_pos, marker_mask, qtype)");
-    println!("\nOption Evaluation (Calibrated via RLCD temp = {:.2}):", temperature);
-    for (opt, (raw, prob)) in AUTOMATION_OPTIONS.iter().zip(result.raw_logits.iter().zip(result.calibrated_probs.iter())) {
-        let is_chosen = *opt == result.action;
-        let prefix = if is_chosen { "-> [CHOSEN]" } else { "   " };
-        println!("{} {:<20} | Raw Logit: {:>6.3} | Calibrated: {:>6.2}%", prefix, opt, raw, prob * 100.0);
+    if !json_mode {
+        println!("--------------------------------------------------");
+        println!(">>> Real ONNX Neural Inference Diagnostic Data <<<");
+        println!("--------------------------------------------------");
+        println!("Inference Latency: {:.2} ms", result.latency_ms);
+        println!("Model Input Contract: 5 tensors (input_ids, attention_mask, marker_pos, marker_mask, qtype)");
+        println!("\nOption Evaluation (Calibrated via RLCD temp = {:.2}):", temperature);
+        for (opt, (raw, prob)) in AUTOMATION_OPTIONS.iter().zip(result.raw_logits.iter().zip(result.calibrated_probs.iter())) {
+            let is_chosen = *opt == result.action;
+            let prefix = if is_chosen { "-> [CHOSEN]" } else { "   " };
+            println!("{} {:<20} | Raw Logit: {:>6.3} | Calibrated: {:>6.2}%", prefix, opt, raw, prob * 100.0);
+        }
+        println!("\nAct Gate (act_logits) : [Answer: {:.4}, Escalate: {:.4}]", result.act_scores.0, result.act_scores.1);
+        println!("Escalate / Abstain    : {}", if result.should_escalate { "YES" } else { "NO" });
+        println!("Final Routing Action  : {}", result.action);
+        println!("Confidence Score      : {:.2}%", result.confidence * 100.0);
+        println!("--------------------------------------------------\n");
     }
-    println!("\nAct Gate (act_logits) : [Answer: {:.4}, Escalate: {:.4}]", result.act_scores.0, result.act_scores.1);
-    println!("Escalate / Abstain    : {}", if result.should_escalate { "YES" } else { "NO" });
-    println!("Final Routing Action  : {}", result.action);
-    println!("Confidence Score      : {:.2}%", result.confidence * 100.0);
-    println!("--------------------------------------------------\n");
 
-    // 5. Safety check: Escalate or block if confidence is low or action flagged
-    if result.should_escalate || result.confidence < 0.35 {
-        println!("[ABORT] Confidence is below safety threshold or model triggered abstain gate.");
-        println!("Request not executed on system for safety.");
+    // 4. Guardrail Gate 3: Confidence & Act Gate Floor Check (>= 75.0%)
+    if result.should_escalate || result.confidence < MINIMUM_CONFIDENCE_THRESHOLD {
+        log_automation_event(
+            &models_dir,
+            &input_prompt,
+            result.action,
+            result.confidence,
+            "NEURAL_MODEL",
+            if execute_mode { "EXECUTE" } else { "DRY_RUN" },
+            "BLOCKED_LOW_CONFIDENCE",
+        );
+
+        let reason = if result.should_escalate {
+            "Model act gate triggered escalate/abstain flag".to_string()
+        } else {
+            format!("Confidence score ({:.2}%) is below the safety threshold of {:.2}%", result.confidence * 100.0, MINIMUM_CONFIDENCE_THRESHOLD * 100.0)
+        };
+
+        if json_mode {
+            emit_json_and_exit(
+                result.action,
+                result.confidence,
+                result.should_escalate,
+                is_action_mutating(result.action),
+                result.latency_ms,
+                "NEURAL_MODEL",
+                "BLOCKED_LOW_CONFIDENCE",
+                Some(reason),
+            );
+        } else {
+            println!("[ABORT] {}.", reason);
+            println!("Action '{}' was blocked from automatic execution for system safety.", result.action);
+        }
         return Ok(());
     }
 
-    // 6. Execute selected Windows action
-    execute_windows_action(result.action, &input_prompt)?;
+    // 5. Guardrail Gate 4: Mutating Action Execution & Confirmation
+    let mutating = is_action_mutating(result.action);
+
+    if mutating {
+        if !execute_mode {
+            log_automation_event(
+                &models_dir,
+                &input_prompt,
+                result.action,
+                result.confidence,
+                "NEURAL_MODEL",
+                "DRY_RUN",
+                "PREVIEW_COMPLETED",
+            );
+
+            if json_mode {
+                emit_json_and_exit(
+                    result.action,
+                    result.confidence,
+                    result.should_escalate,
+                    true,
+                    result.latency_ms,
+                    "NEURAL_MODEL",
+                    "PREVIEW_ONLY",
+                    None,
+                );
+            } else {
+                println!("[DRY-RUN DEFAULT] Action '{}' is mutating. Running in preview mode.", result.action);
+                execute_windows_action(result.action, &input_prompt, false)?;
+                println!("\n[HINT] To apply actual changes, re-run with '--execute' and confirm the prompt [y/N].");
+            }
+            return Ok(());
+        }
+
+        // Execute mode requires interactive confirmation
+        if !confirm_action(result.action, &input_prompt) {
+            log_automation_event(
+                &models_dir,
+                &input_prompt,
+                result.action,
+                result.confidence,
+                "NEURAL_MODEL",
+                "EXECUTE",
+                "USER_CANCELLED",
+            );
+
+            if json_mode {
+                emit_json_and_exit(
+                    result.action,
+                    result.confidence,
+                    result.should_escalate,
+                    true,
+                    result.latency_ms,
+                    "NEURAL_MODEL",
+                    "USER_CANCELLED",
+                    Some("Operation was cancelled by the user at confirmation prompt".to_string()),
+                );
+            } else {
+                println!("\n[ABORTED] Action cancelled by user. No system changes were made.");
+            }
+            return Ok(());
+        }
+    }
+
+    // 6. Execute selected action
+    log_automation_event(
+        &models_dir,
+        &input_prompt,
+        result.action,
+        result.confidence,
+        "NEURAL_MODEL",
+        if mutating { "EXECUTE" } else { "READ_ONLY" },
+        "SUCCESS",
+    );
+
+    if json_mode {
+        emit_json_and_exit(
+            result.action,
+            result.confidence,
+            result.should_escalate,
+            mutating,
+            result.latency_ms,
+            "NEURAL_MODEL",
+            "SUCCESS",
+            None,
+        );
+    } else {
+        execute_windows_action(result.action, &input_prompt, execute_mode)?;
+    }
 
     Ok(())
 }
 
 fn print_usage(prog_name: &str) {
-    println!("Usage: {} \"<request text>\"", prog_name);
+    println!("Usage: {} [--json] [--execute] \"<request text>\"", prog_name);
+    println!("\nFlags:");
+    println!("  --json           Output structured JSON result for agent skills and automated scripts");
+    println!("  --execute, -e    Enable execution of mutating actions (defaults to safe dry-run preview)");
     println!("\nExamples:");
+    println!("  # JSON Output for AI Agent Integration:");
+    println!("  {} --json \"find which processes are hogging all my RAM\"", prog_name);
+    println!("  {} --json \"git status\"", prog_name);
+    println!("\n  # Safe Read-Only Queries (Run directly):");
     println!("  {} \"find which processes are hogging all my RAM\"", prog_name);
-    println!("  {} \"tidy up my downloads folder by sorting files\"", prog_name);
+    println!("  {} \"git status\"", prog_name);
+    println!("  {} \"git log\"", prog_name);
+    println!("\n  # Mutating Actions (Dry-run by default):");
     println!("  {} \"delete temporary files in Windows cache\"", prog_name);
+    println!("  {} --execute \"delete temporary files in Windows cache\"  # Prompts [y/N]", prog_name);
+    println!("\n  # Hard-Blocked Policies (Always rejected):");
     println!("  {} \"delete system32 and wipe C: drive\"", prog_name);
 }
 
@@ -179,7 +578,6 @@ fn resolve_models_dir() -> PathBuf {
     PathBuf::from("models")
 }
 
-/// Builds an ORT session strictly capped for minimal memory overhead
 fn build_low_memory_session(env: &Environment, model_path: &Path) -> Result<Session> {
     let mut builder = Session::builder(env)
         .map_err(|e| anyhow!("Failed to create SessionBuilder: {}", e))?;
@@ -211,7 +609,6 @@ struct NeuralDecisionResult<'a> {
     act_scores: (f32, f32),
 }
 
-/// Evaluates Laya's exact 5-tensor input contract
 fn evaluate_laya_decision<'a>(
     session: &mut Session,
     tokenizer: &Tokenizer,
@@ -224,7 +621,6 @@ fn evaluate_laya_decision<'a>(
     let sep_id = tokenizer.token_to_id("[SEP]").unwrap_or(2);
     let mask_id = tokenizer.token_to_id("[MASK]").unwrap_or(4);
 
-    // Layout: [CLS] question [SEP] [MASK] opt_1 [SEP] [MASK] opt_2 [SEP] ... [SEP] [SEP] state [SEP]
     let mut input_ids: Vec<i64> = vec![cls_id as i64];
 
     let q_enc = tokenizer
@@ -235,7 +631,7 @@ fn evaluate_laya_decision<'a>(
 
     let mut marker_positions: Vec<i64> = Vec::with_capacity(options.len());
     for opt in options {
-        marker_positions.push(input_ids.len() as i64); // Index of [MASK]
+        marker_positions.push(input_ids.len() as i64);
         input_ids.push(mask_id as i64);
 
         let opt_enc = tokenizer
@@ -245,7 +641,6 @@ fn evaluate_laya_decision<'a>(
         input_ids.push(sep_id as i64);
     }
 
-    // Double [SEP] before state
     input_ids.push(sep_id as i64);
     let state_enc = tokenizer
         .encode(state, false)
@@ -287,7 +682,7 @@ fn evaluate_laya_decision<'a>(
     let attn_mask_arr = Array2::from_shape_vec((1, max_seq_len), attention_mask)?;
     let marker_pos_arr = Array2::from_shape_vec((1, max_options), marker_positions)?;
     let marker_mask_arr = Array2::from_shape_vec((1, max_options), marker_mask)?;
-    let qtype_arr = Array1::from_vec(vec![0_i64]); // 0 = choice
+    let qtype_arr = Array1::from_vec(vec![0_i64]);
 
     let infer_start = std::time::Instant::now();
     let outputs = session.run(inputs![
@@ -299,7 +694,6 @@ fn evaluate_laya_decision<'a>(
     ])?;
     let latency_ms = infer_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Extract logits for options safely from outputs map
     let raw_logits_extracted = if let Some(t) = outputs.get("logits") {
         let (_, v) = t.try_extract_tensor::<f32>()?;
         v.to_vec()
@@ -313,20 +707,21 @@ fn evaluate_laya_decision<'a>(
     let raw_logits: Vec<f32> = raw_logits_extracted[..num_options.min(raw_logits_extracted.len())].to_vec();
     let probs = calibrated_softmax(&raw_logits, temperature);
 
-    // Extract act_logits (2-way gate: [0] = answer, [1] = escalate/abstain)
     let mut act_scores = (0.0_f32, 0.0_f32);
     let mut should_escalate = false;
-    if let Some(act_tensor) = outputs.get("act_logits").or_else(|| outputs.get("act")) {
-        if let Ok((_, act_vals)) = act_tensor.try_extract_tensor::<f32>() {
-            if act_vals.len() >= 2 {
-                act_scores = (act_vals[0], act_vals[1]);
-                should_escalate = act_vals[1] > act_vals[0];
+    if let Some(t) = outputs.get("act_logits") {
+        if let Ok((_, v)) = t.try_extract_tensor::<f32>() {
+            if v.len() >= 2 {
+                act_scores = (v[0], v[1]);
+                if v[1] > v[0] {
+                    should_escalate = true;
+                }
             }
         }
     }
 
     let mut best_idx = 0;
-    let mut best_prob = 0.0;
+    let mut best_prob = -1.0_f32;
     for (i, &p) in probs.iter().enumerate() {
         if p > best_prob {
             best_prob = p;
@@ -345,15 +740,23 @@ fn evaluate_laya_decision<'a>(
     })
 }
 
-fn calibrated_softmax(logits: &[f32], temp: f32) -> Vec<f32> {
-    let t = if temp <= 0.01 { 1.0 } else { temp };
-    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&x| ((x - max_val) / t).exp()).collect();
+fn calibrated_softmax(logits: &[f32], temperature: f32) -> Vec<f32> {
+    if logits.is_empty() {
+        return Vec::new();
+    }
+    let temp = if temperature > 0.0 { temperature } else { 1.0 };
+    let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+    let exps: Vec<f32> = logits
+        .iter()
+        .map(|&l| ((l - max_logit) / temp).exp())
+        .collect();
     let sum: f32 = exps.iter().sum();
-    if sum == 0.0 {
-        vec![1.0 / logits.len() as f32; logits.len()]
+
+    if sum > 0.0 {
+        exps.into_iter().map(|e| e / sum).collect()
     } else {
-        exps.into_iter().map(|x| x / sum).collect()
+        vec![1.0 / logits.len() as f32; logits.len()]
     }
 }
 
@@ -368,7 +771,6 @@ fn load_temperature(config_path: &Path, num_options: usize) -> f32 {
     1.05
 }
 
-/// Fallback heuristic routing when model file is not yet downloaded
 fn fallback_heuristic_routing(prompt: &str) -> (&'static str, f32) {
     let lower = prompt.to_lowercase();
     if lower.contains("ram") || lower.contains("cpu") || lower.contains("process") || lower.contains("triage") {
@@ -384,9 +786,9 @@ fn fallback_heuristic_routing(prompt: &str) -> (&'static str, f32) {
     }
 }
 
-/// Native Windows Automation Dispatcher
-fn execute_windows_action(action: &str, prompt: &str) -> Result<()> {
-    println!("[DISPATCHER] Executing native Windows action: '{}'", action);
+/// Native Windows Automation Dispatcher with Safe Dry-Run and Allowlisted Git Execution
+fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Result<()> {
+    println!("[DISPATCHER] Target Action: '{}'", action);
 
     match action {
         "system_triage" => {
@@ -400,6 +802,45 @@ fn execute_windows_action(action: &str, prompt: &str) -> Result<()> {
 
             println!("{}", String::from_utf8_lossy(&output.stdout));
             println!("[DONE] System triage completed.");
+        }
+
+        "clean_temp" => {
+            let temp_dir = env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string());
+            println!("\n>>> Windows Temp Cache: {:?}", temp_dir);
+
+            let mut total_bytes: u64 = 0;
+            let mut file_count = 0;
+            let mut deleted_count = 0;
+            let mut deleted_bytes: u64 = 0;
+
+            if let Ok(entries) = fs::read_dir(&temp_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Ok(meta) = path.metadata() {
+                            total_bytes += meta.len();
+                            file_count += 1;
+
+                            if execute_mode {
+                                if fs::remove_file(&path).is_ok() {
+                                    deleted_count += 1;
+                                    deleted_bytes += meta.len();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let size_mb = (total_bytes as f64) / (1024.0 * 1024.0);
+            if execute_mode {
+                let freed_mb = (deleted_bytes as f64) / (1024.0 * 1024.0);
+                println!("[EXECUTED] Deleted {} unlocked files ({:.2} MB freed).", deleted_count, freed_mb);
+                println!("Locked files currently in use by Windows apps were safely preserved.");
+            } else {
+                println!("Scanned {} files ({:.2} MB).", file_count, size_mb);
+                println!("[DRY-RUN DEFAULT] No files deleted. Pass '--execute' to perform cleanup.");
+            }
         }
 
         "organize_downloads" => {
@@ -417,9 +858,9 @@ fn execute_windows_action(action: &str, prompt: &str) -> Result<()> {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_file() {
-                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("none");
                         count += 1;
                         if count <= 5 {
+                            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("none");
                             println!("  [Found File] {:?} (ext: .{})", path.file_name().unwrap_or_default(), ext);
                         }
                     }
@@ -427,35 +868,95 @@ fn execute_windows_action(action: &str, prompt: &str) -> Result<()> {
             }
 
             println!("Total scanned files in Downloads: {}", count);
-            println!("[NOTE] Dry-run audit completed. Set auto_move=true to categorize into Subfolders.");
+            if execute_mode {
+                println!("[SAFEGUARD] Auto-move is currently disabled. Files in Downloads remain untouched.");
+            } else {
+                println!("[DRY-RUN DEFAULT] No files moved. Pass '--execute' to organize files into subfolders.");
+            }
         }
 
-        "clean_temp" => {
-            let temp_dir = env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string());
-            println!("\n>>> Inspecting Windows Temp Cache: {:?}", temp_dir);
+        "git_status" => {
+            println!("\n>>> Running Read-Only Git Status (git status --short)...");
+            let output = Command::new("git")
+                .arg("status")
+                .arg("--short")
+                .output();
 
-            let mut total_bytes: u64 = 0;
-            let mut file_count = 0;
-            if let Ok(entries) = fs::read_dir(&temp_dir) {
-                for entry in entries.flatten() {
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() {
-                            total_bytes += meta.len();
-                            file_count += 1;
-                        }
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if text.trim().is_empty() {
+                        println!("Working tree clean (no modified or untracked files).");
+                    } else {
+                        println!("{}", text);
                     }
+                    println!("[DONE] Read-only Git status check completed.");
+                }
+                Ok(out) => {
+                    println!("[WARN] Git command returned non-zero status:");
+                    println!("{}", String::from_utf8_lossy(&out.stderr));
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute git: {}", e);
                 }
             }
+        }
 
-            let size_mb = (total_bytes as f64) / (1024.0 * 1024.0);
-            println!("Temp files scanned: {} files ({:.2} MB)", file_count, size_mb);
-            println!("[DONE] Cache inspection complete. Temp storage intact.");
+        "git_log" => {
+            println!("\n>>> Running Read-Only Git Log (git log -n 5 --oneline)...");
+            let output = Command::new("git")
+                .arg("log")
+                .arg("-n")
+                .arg("5")
+                .arg("--oneline")
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    println!("{}", String::from_utf8_lossy(&out.stdout));
+                    println!("[DONE] Read-only Git log check completed.");
+                }
+                Ok(out) => {
+                    println!("[WARN] Git log returned error:");
+                    println!("{}", String::from_utf8_lossy(&out.stderr));
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute git: {}", e);
+                }
+            }
+        }
+
+        "git_stash_list" => {
+            println!("\n>>> Running Read-Only Git Stash List (git stash list)...");
+            let output = Command::new("git")
+                .arg("stash")
+                .arg("list")
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if text.trim().is_empty() {
+                        println!("No stashed changes found.");
+                    } else {
+                        println!("{}", text);
+                    }
+                    println!("[DONE] Read-only Git stash list check completed.");
+                }
+                Ok(out) => {
+                    println!("[WARN] Git stash list returned error:");
+                    println!("{}", String::from_utf8_lossy(&out.stderr));
+                }
+                Err(e) => {
+                    println!("[ERROR] Failed to execute git: {}", e);
+                }
+            }
         }
 
         "block_unsafe" => {
             println!("\n[GUARDRAIL TRIGGERED] Action blocked!");
             println!("The prompt '{}' was classified as unsafe or destructive.", prompt);
-            println!("No filesystem changes were made.");
+            println!("No filesystem changes or commands were executed.");
         }
 
         _ => {
@@ -465,4 +966,3 @@ fn execute_windows_action(action: &str, prompt: &str) -> Result<()> {
 
     Ok(())
 }
-

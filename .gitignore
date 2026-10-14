@@ -3,3 +3,4 @@ models/*.onnx
 models/*.bin
 models/*.dll
 models/tokenizer.json
+logs/
