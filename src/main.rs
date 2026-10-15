@@ -119,14 +119,12 @@ fn check_allowlisted_fast_path(prompt: &str) -> Option<(&'static str, &'static s
     // Tier 1: Laravel Read-Only Checks
     if trimmed.contains("artisan test") || trimmed == "test" || trimmed.contains("run tests") || trimmed.contains("backend tests") {
         Some(("laravel_test", "Run Laravel Backend Test Suite (php artisan test)", false))
-    } else if trimmed.contains("route:list") || trimmed.contains("list routes") || trimmed.contains("show routes") {
+    } else if trimmed.contains("route:list") || trimmed.contains("list routes") || trimmed.contains("show routes") || trimmed.contains("inspect routes") {
         Some(("laravel_route_list", "Inspect Laravel Registered Routes (php artisan route:list)", false))
 
-    // Tier 2: Edge Engine & Protocol Checks (Read-Only)
+    // Tier 2: Edge Engine Checks (Read-Only)
     } else if trimmed.contains("edge-engine") || trimmed.contains("check edge") || trimmed.contains("edge check") {
         Some(("edge_engine_check", "Verify Edge Engine Compilation (cargo check -j 2)", false))
-    } else if trimmed.contains("protocol test") || trimmed.contains("test protocol") || trimmed.contains("packages/protocol") {
-        Some(("protocol_test", "Test Terminal Protocol (cargo test in packages/protocol)", false))
 
     // Tier 3: Git Read-Only Checks
     } else if trimmed.contains("git diff") || trimmed.contains("diff stat") || trimmed == "diff" {
@@ -145,6 +143,13 @@ fn check_allowlisted_fast_path(prompt: &str) -> Option<(&'static str, &'static s
         Some(("npm_build", "Compile Frontend Assets (npm run build)", true))
     } else if trimmed.contains("optimize:clear") || trimmed.contains("clear cache") || trimmed.contains("artisan cache:clear") {
         Some(("laravel_clear_cache", "Clear Laravel Caches (php artisan optimize:clear)", true))
+    } else if trimmed.contains("clean temporary") || trimmed.contains("clean temp") || trimmed == "clean" {
+        Some(("clean_temp", "Clean Temporary Directory (clears %TEMP%)", true))
+    } else if (trimmed.contains("automate") || trimmed.contains("manage") || trimmed.contains("develop") || trimmed.contains("antigravity"))
+        && (trimmed.contains("project") || trimmed.contains("absensi-cam") || trimmed.contains("repo") || trimmed.contains("d:\\") || trimmed.contains("e:\\"))
+        && !trimmed.contains("test") && !trimmed.contains("build") && !trimmed.contains("clean") && !trimmed.contains("diff") && !trimmed.contains("status") && !trimmed.contains("route")
+    {
+        Some(("open_ended_task", "Open-Ended Project Automation Request (Hand off to Antigravity)", false))
     } else {
         None
     }
@@ -153,7 +158,7 @@ fn check_allowlisted_fast_path(prompt: &str) -> Option<(&'static str, &'static s
 fn is_action_mutating(action: &str) -> bool {
     match action {
         "system_triage" | "git_status" | "git_log" | "git_stash_list" | "git_diff"
-        | "laravel_test" | "laravel_route_list" | "edge_engine_check" | "protocol_test"
+        | "laravel_test" | "laravel_route_list" | "edge_engine_check" | "open_ended_task"
         | "block_unsafe" => false,
 
         "clean_temp" | "organize_downloads" | "git_pull_ff_only" | "npm_build"
@@ -214,6 +219,36 @@ fn current_timestamp() -> String {
     }
     let day = remaining_days + 1;
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", year, month, day, hours, mins, secs)
+}
+
+/// Resolves the root directory of the absensi-cam project
+fn resolve_absensi_cam_root() -> Option<PathBuf> {
+    // 1. Explicit environment variable
+    if let Ok(dir_str) = env::var("ABSENSI_CAM_DIR") {
+        let p = PathBuf::from(dir_str);
+        if p.join("artisan").exists() {
+            return Some(p);
+        }
+    }
+    // 2. Current working directory
+    if let Ok(current) = env::current_dir() {
+        if current.join("artisan").exists() {
+            return Some(current);
+        }
+        // 3. Sibling directory ../absensi-cam
+        if let Some(parent) = current.parent() {
+            let sibling = parent.join("absensi-cam");
+            if sibling.join("artisan").exists() {
+                return Some(sibling);
+            }
+        }
+    }
+    // 4. Known standard local project location
+    let standard_d = PathBuf::from(r"D:\Github\absensi-cam");
+    if standard_d.join("artisan").exists() {
+        return Some(standard_d);
+    }
+    None
 }
 
 fn log_automation_event(
@@ -323,6 +358,37 @@ fn main() -> Result<()> {
 
     // 2. Guardrail Gate 2: Deterministic Fast-Path Allowlist
     if let Some((action, desc, mutating)) = check_allowlisted_fast_path(&input_prompt) {
+        if action == "open_ended_task" {
+            log_automation_event(
+                &models_dir,
+                &input_prompt,
+                "none",
+                0.0,
+                "REFUSAL_OPEN_ENDED",
+                "READ_ONLY",
+                "REFUSED_NO_MATCH",
+            );
+
+            if json_mode {
+                emit_json_and_exit(
+                    "none",
+                    0.0,
+                    true,
+                    false,
+                    0.0,
+                    "REFUSAL_OPEN_ENDED",
+                    "REFUSED_NO_MATCH",
+                    Some("Request is an open-ended project goal rather than a bounded action.".to_string()),
+                );
+                return Ok(());
+            }
+
+            println!(">>> Refusal: Open-ended project automation goal <<<");
+            println!("Action     : none (no allowlisted match)\n");
+            execute_windows_action(action, &input_prompt, false)?;
+            return Ok(());
+        }
+
         log_automation_event(
             &models_dir,
             &input_prompt,
@@ -1096,15 +1162,37 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
 
         "laravel_test" => {
             println!("\n>>> Running Laravel Backend Tests (php artisan test)...");
-            if !Path::new("artisan").exists() {
-                println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
-                println!("Please run this command from the root of your Laravel project (absensi-cam).");
+            let absensi_root = match resolve_absensi_cam_root() {
+                Some(p) => p,
+                None => {
+                    println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
+                    println!("Please set $env:ABSENSI_CAM_DIR = \"path\\to\\absensi-cam\" or run from the absensi-cam project root.");
+                    return Ok(());
+                }
+            };
+            println!("Target Directory : {:?}", absensi_root);
+
+            // Database safety check: inspect phpunit.xml to ensure isolated test database
+            let phpunit_path = absensi_root.join("phpunit.xml");
+            if phpunit_path.exists() {
+                if let Ok(content) = fs::read_to_string(&phpunit_path) {
+                    let has_sqlite = content.contains("DB_CONNECTION") && (content.contains("sqlite") || content.contains(":memory:"));
+                    let has_test_db = content.contains("DB_DATABASE") && (content.contains(":memory:") || content.contains("testing") || content.contains("_test"));
+                    if !has_sqlite && !has_test_db {
+                        println!("\n[SAFETY CHECK FAILED] phpunit.xml does not configure an in-memory or isolated test database (e.g. DB_CONNECTION=sqlite or DB_DATABASE=:memory:).");
+                        println!("Aborting test execution to safeguard production attendance and biometric records.");
+                        return Ok(());
+                    }
+                }
+            } else {
+                println!("[SAFETY NOTE] phpunit.xml not found at {:?}. Aborting to prevent running against default database.", phpunit_path);
                 return Ok(());
             }
 
             let output = Command::new("php")
                 .arg("artisan")
                 .arg("test")
+                .current_dir(&absensi_root)
                 .output();
 
             match output {
@@ -1127,15 +1215,20 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
 
         "laravel_route_list" => {
             println!("\n>>> Inspecting Laravel Routes (php artisan route:list)...");
-            if !Path::new("artisan").exists() {
-                println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
-                println!("Please run this command from the root of your Laravel project (absensi-cam).");
-                return Ok(());
-            }
+            let absensi_root = match resolve_absensi_cam_root() {
+                Some(p) => p,
+                None => {
+                    println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
+                    println!("Please set $env:ABSENSI_CAM_DIR = \"path\\to\\absensi-cam\" or run from the absensi-cam project root.");
+                    return Ok(());
+                }
+            };
+            println!("Target Directory : {:?}", absensi_root);
 
             let output = Command::new("php")
                 .arg("artisan")
                 .arg("route:list")
+                .current_dir(&absensi_root)
                 .output();
 
             match output {
@@ -1158,15 +1251,20 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
 
         "edge_engine_check" => {
             println!("\n>>> Compile-Checking Edge Engine (cargo check -j 2)...");
-            let edge_dir = Path::new("clients/edge-engine-rs");
+            let absensi_root = resolve_absensi_cam_root();
+            let base_dir = absensi_root.as_deref().unwrap_or_else(|| Path::new("."));
+            let edge_dir = base_dir.join("clients").join("edge-engine-rs");
+
+            if !edge_dir.exists() || !edge_dir.join("Cargo.toml").exists() {
+                println!("[INFO] 'clients/edge-engine-rs/Cargo.toml' not found at {:?}", edge_dir);
+                println!("Please set $env:ABSENSI_CAM_DIR or run from the absensi-cam project root.");
+                return Ok(());
+            }
+
             let mut cmd = Command::new("cargo");
             cmd.arg("check").arg("-j").arg("2");
-            if edge_dir.exists() {
-                cmd.current_dir(edge_dir);
-                println!("Working directory: {:?}", edge_dir);
-            } else {
-                println!("[INFO] 'clients/edge-engine-rs' not in current directory. Checking current workspace...");
-            }
+            cmd.current_dir(&edge_dir);
+            println!("Working directory: {:?}", edge_dir);
 
             match cmd.output() {
                 Ok(out) => {
@@ -1183,46 +1281,28 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
             }
         }
 
-        "protocol_test" => {
-            println!("\n>>> Testing Terminal Protocol (cargo test)...");
-            let proto_dir = Path::new("packages/protocol");
-            let mut cmd = Command::new("cargo");
-            cmd.arg("test");
-            if proto_dir.exists() {
-                cmd.current_dir(proto_dir);
-                println!("Working directory: {:?}", proto_dir);
-            } else {
-                println!("[INFO] 'packages/protocol' not in current directory. Running cargo test locally...");
-            }
-
-            match cmd.output() {
-                Ok(out) => {
-                    println!("{}", String::from_utf8_lossy(&out.stdout));
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    if !err.trim().is_empty() {
-                        println!("{}", err);
-                    }
-                    println!("[DONE] Protocol tests finished.");
-                }
-                Err(e) => {
-                    println!("[ERROR] Failed to execute cargo test: {}", e);
-                }
-            }
-        }
-
         "npm_build" => {
             if execute_mode {
                 println!("\n>>> Building Frontend Assets (npm run build)...");
-                if !Path::new("package.json").exists() {
-                    println!("[INFO] 'package.json' not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
-                    println!("Please run this command from the directory containing package.json.");
-                    return Ok(());
-                }
+                let absensi_root = match resolve_absensi_cam_root() {
+                    Some(p) => p,
+                    None => {
+                        let cur = env::current_dir().unwrap_or_default();
+                        if cur.join("package.json").exists() {
+                            cur
+                        } else {
+                            println!("[INFO] 'package.json' not found in current directory ({:?}).", cur);
+                            println!("Please set $env:ABSENSI_CAM_DIR or run from the directory containing package.json.");
+                            return Ok(());
+                        }
+                    }
+                };
 
                 let npm_bin = if cfg!(windows) { "npm.cmd" } else { "npm" };
                 let output = Command::new(npm_bin)
                     .arg("run")
                     .arg("build")
+                    .current_dir(&absensi_root)
                     .output();
 
                 match output {
@@ -1246,15 +1326,19 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
         "laravel_clear_cache" => {
             if execute_mode {
                 println!("\n>>> Clearing Laravel Caches (php artisan optimize:clear)...");
-                if !Path::new("artisan").exists() {
-                    println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
-                    println!("Please run this command from the root of your Laravel project (absensi-cam).");
-                    return Ok(());
-                }
+                let absensi_root = match resolve_absensi_cam_root() {
+                    Some(p) => p,
+                    None => {
+                        println!("[INFO] 'artisan' entrypoint not found in current directory ({:?}).", env::current_dir().unwrap_or_default());
+                        println!("Please set $env:ABSENSI_CAM_DIR = \"path\\to\\absensi-cam\" or run from the absensi-cam project root.");
+                        return Ok(());
+                    }
+                };
 
                 let output = Command::new("php")
                     .arg("artisan")
                     .arg("optimize:clear")
+                    .current_dir(&absensi_root)
                     .output();
 
                 match output {
@@ -1273,6 +1357,21 @@ fn execute_windows_action(action: &str, prompt: &str, execute_mode: bool) -> Res
             } else {
                 println!("\n[DRY-RUN DEFAULT] Target command: 'php artisan optimize:clear'. Pass '--execute' and confirm [y/N] to clear caches.");
             }
+        }
+
+        "open_ended_task" => {
+            println!("[INFO] Laya-Siro is a typed decision classifier and safety gate for bounded actions.");
+            println!("Request '{}' is an open-ended project automation goal.", prompt);
+            println!("\nTo execute specific bounded operations on absensi-cam via Laya, use:");
+            println!("  siro \"run backend tests\"       -> php artisan test (safe, sqlite in-memory)");
+            println!("  siro \"inspect routes\"          -> php artisan route:list");
+            println!("  siro \"check edge engine\"       -> cargo check -j 2 in clients/edge-engine-rs");
+            println!("  siro \"git diff\"                -> git diff --stat");
+            println!("  siro \"git status\"              -> git status --short");
+            println!("  siro \"build frontend assets\"   -> npm run build (mutating, confirmed)");
+            println!("  siro \"clear cache\"             -> php artisan optimize:clear (mutating, confirmed)");
+            println!("  siro \"clean temporary files\"   -> clears %TEMP% (mutating, confirmed)");
+            println!("\nFor autonomous code authoring, multi-file edits, or architecture tasks, ask Antigravity directly.");
         }
 
         "block_unsafe" => {

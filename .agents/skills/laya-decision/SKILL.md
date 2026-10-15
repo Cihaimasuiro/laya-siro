@@ -19,7 +19,6 @@ Use `laya-decision` to classify user automation requests into bounded, allowlist
 | `laravel_test` | Read-only | `php artisan test` backend suite | Executes directly without confirmation |
 | `laravel_route_list` | Read-only | `php artisan route:list` inspection | Executes directly without confirmation |
 | `edge_engine_check` | Read-only | `cargo check -j 2` in `clients/edge-engine-rs` | Executes directly without confirmation |
-| `protocol_test` | Read-only | `cargo test` in `packages/protocol` | Executes directly without confirmation |
 | `git_diff` | Read-only | `git diff --stat` working tree summary | Executes directly without confirmation |
 | `git_status` | Read-only | `git status --short` in current workspace | Executes directly without confirmation |
 | `git_log` | Read-only | `git log -n 5 --oneline` commit history | Executes directly without confirmation |
